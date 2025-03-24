@@ -1,0 +1,97 @@
+#!/bin/bash
+
+# Log file setup with timestamp
+LOG_DATE=$(date -u +"%Y-%m-%d %H:%M:%S")
+CURRENT_USER=$(whoami)
+LOG_FILE="rebuild.log"
+
+echo "==================================" >> $LOG_FILE
+echo "Rebuild started at: $LOG_DATE UTC" >> $LOG_FILE
+echo "Executed by user: $CURRENT_USER" >> $LOG_FILE
+echo "==================================" >> $LOG_FILE
+
+# Function to check CPU usage of webpack container
+check_webpack_cpu() {
+    local threshold=30  # CPU usage threshold (%)
+    local stable_count=0
+    local required_stable_counts=6  # Need to be stable for 30 seconds (6 * 5 seconds)
+    
+    echo "Monitoring webpack CPU usage until it stabilizes..."
+    while true; do
+        # Get CPU usage percentage for webpack container
+        local cpu_usage=$(docker stats webpack --no-stream --format "{{.CPUPerc}}" | sed 's/%//')
+        
+        echo -ne "\rCurrent webpack CPU usage: ${cpu_usage}% "
+        
+        if (( $(echo "$cpu_usage < $threshold" | bc -l) )); then
+            stable_count=$((stable_count + 1))
+            echo -n "(Stable for $((stable_count * 5)) seconds)"
+        else
+            stable_count=0
+            echo -n "(Waiting for CPU to go below ${threshold}%)"
+        fi
+        
+        if [ $stable_count -ge $required_stable_counts ]; then
+            echo -e "\nWebpack processing has stabilized."
+            break
+        fi
+        
+        sleep 5
+    done
+}
+
+# Function to log commands and their output
+log_command() {
+    local cmd=$1
+    local wait_for_cpu=$2
+    
+    echo "Executing: $cmd" | tee -a $LOG_FILE
+    echo "Command started at: $(date -u +"%Y-%m-%d %H:%M:%S") UTC" >> $LOG_FILE
+    
+    eval $cmd 2>&1 | tee -a $LOG_FILE
+    
+    if [ "$wait_for_cpu" = "true" ]; then
+        check_webpack_cpu
+    fi
+    
+    echo "" >> $LOG_FILE
+}
+
+# Execute commands
+echo "Starting rebuild process..."
+
+# First batch of commands
+commands_first=(
+    "docker compose down"
+    "docker compose up --build -d"
+    "docker compose exec php bin/console cache:clear"
+    "docker compose exec webpack npm install"
+)
+
+# The critical webpack command
+webpack_command="docker compose exec webpack npm run dev"
+
+# Commands to run after webpack is stable
+commands_last=(
+    "docker compose exec php composer install --optimize-autoloader"
+    "docker compose exec php bin/console assets:install --symlink"
+    "docker compose exec php bin/console cache:clear"
+)
+
+# Run first batch
+for cmd in "${commands_first[@]}"; do
+    echo "Running: $cmd"
+    log_command "$cmd" "false"
+done
+
+# Run webpack command and wait for CPU to stabilize
+echo "Running webpack build..."
+log_command "$webpack_command" "true"
+
+# Run final commands after webpack is stable
+for cmd in "${commands_last[@]}"; do
+    echo "Running: $cmd"
+    log_command "$cmd" "false"
+done
+
+echo "Rebuild complete! Check $LOG_FILE for details."
